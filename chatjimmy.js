@@ -607,7 +607,6 @@ async function handleOpenAINonStreamingResponse(upstreamResponse, requestModel, 
       usage: buildUsage(parsed.stats)
    };
 
-   if (parsed.stats) response.chatjimmy_stats = parsed.stats;
    return json(200, response);
 }
 
