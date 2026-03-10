@@ -1,0 +1,6 @@
+name = "chatjimmy"
+main = "chatjimmy.js"
+compatibility_date = "2025-12-01"
+
+[observability]
+enabled = true

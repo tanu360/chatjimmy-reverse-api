@@ -1,0 +1,27 @@
+{
+   "name": "chatjimmy",
+   "version": "1.0.0",
+   "description": "Free OpenAI & Anthropic compatible API proxy powered by chatjimmy.ai",
+   "main": "chatjimmy.js",
+   "type": "module",
+   "scripts": {
+      "dev": "wrangler dev",
+      "deploy": "wrangler deploy",
+      "tail": "wrangler tail"
+   },
+   "keywords": [
+      "openai",
+      "anthropic",
+      "llm",
+      "proxy",
+      "cloudflare-workers",
+      "chatjimmy",
+      "llama",
+      "api"
+   ],
+   "author": "tarun",
+   "license": "MIT",
+   "devDependencies": {
+      "wrangler": "^4.71.0"
+   }
+}
