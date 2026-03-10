@@ -1106,6 +1106,8 @@ async function handleOpenAIChatCompletions(req) {
          const tc = body.tool_choice;
          if (tc === 'none') {
             toolChoiceHint = '\nDo NOT call any tools. Respond in plain text only.';
+         } else if (tc === 'required') {
+            toolChoiceHint = '\nYou MUST use at least one tool. Do NOT respond with plain text only.';
          } else if (tc && typeof tc === 'object' && tc.type === 'function' && tc.function?.name) {
             toolChoiceHint = `\nYou MUST call the "${tc.function.name}" tool.`;
          } else if (!isSubsequentTurn) {
@@ -1253,7 +1255,9 @@ async function handleAnthropicMessages(req) {
          // Handle tool_choice
          let toolChoiceHint = '';
          const tc = body.tool_choice;
-         if (tc && typeof tc === 'object' && tc.type === 'any') {
+         if (tc && typeof tc === 'object' && tc.type === 'none') {
+            toolChoiceHint = '\nDo NOT call any tools. Respond in plain text only.';
+         } else if (tc && typeof tc === 'object' && tc.type === 'any') {
             toolChoiceHint = '\nYou MUST use at least one tool.';
          } else if (tc && typeof tc === 'object' && tc.type === 'tool' && tc.name) {
             toolChoiceHint = `\nYou MUST call the "${tc.name}" tool.`;
@@ -1281,7 +1285,11 @@ async function handleAnthropicMessages(req) {
                if (block.type === 'text' && typeof block.text === 'string') {
                   parts.push(block.text);
                } else if (block.type === 'tool_use' && msg.role === 'assistant') {
-                  const tcObj = [{ name: block.name, arguments: typeof block.input === 'string' ? JSON.parse(block.input) : (block.input || {}) }];
+                  let parsedInput = block.input || {};
+                  if (typeof block.input === 'string') {
+                     try { parsedInput = JSON.parse(block.input); } catch (_) { parsedInput = {}; }
+                  }
+                  const tcObj = [{ name: block.name, arguments: parsedInput }];
                   parts.push(`${TOOL_CALLS_START}\n${JSON.stringify(tcObj)}\n${TOOL_CALLS_END}`);
                } else if (block.type === 'tool_result' && msg.role === 'user') {
                   let resultContent = '';
