@@ -129,7 +129,8 @@ function buildToolSystemPrompt(tools) {
       const fn = t.function || t;
       const obj = { name: fn.name };
       if (fn.description) obj.description = fn.description;
-      if (fn.parameters) obj.parameters = fn.parameters;
+      const params = fn.parameters || fn.input_schema;
+      if (params) obj.parameters = params;
       return obj;
    });
 
