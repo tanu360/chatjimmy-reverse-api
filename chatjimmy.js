@@ -122,15 +122,53 @@ const PUBLIC_IP_RANGES = [
    [203, 16], [203, 32], [203, 56], [203, 96], [203, 128], [203, 176], [203, 220]
 ];
 
+function cleanSchema(schema) {
+   if (!schema || typeof schema !== 'object') return schema;
+   const STRIP = ['$schema', 'title', 'additionalProperties'];
+   const out = {};
+   for (const [k, v] of Object.entries(schema)) {
+      if (STRIP.includes(k)) continue;
+      if (k === 'properties' && v && typeof v === 'object') {
+         const props = {};
+         for (const [pk, pv] of Object.entries(v)) {
+            const cleaned = {};
+            for (const [fk, fv] of Object.entries(pv)) {
+               if (STRIP.includes(fk)) continue;
+               if ((fk === 'anyOf' || fk === 'allOf' || fk === 'oneOf') && Array.isArray(fv)) {
+                  cleaned[fk] = fv.map(s => cleanSchema(s));
+               } else {
+                  cleaned[fk] = fv;
+               }
+            }
+            props[pk] = cleaned;
+         }
+         out.properties = props;
+      } else {
+         out[k] = v;
+      }
+   }
+   return out;
+}
+
+function buildToolReminderPrompt(tools) {
+   if (!Array.isArray(tools) || tools.length === 0) return '';
+   const names = tools.map(t => `"${(t.function || t).name}"`).join(', ');
+   return [
+      'Available tools: ' + names + ' (same definitions as before).',
+      `Call tools using: ${TOOL_CALLS_START}[{"name":"...","arguments":{...}}]${TOOL_CALLS_END}`,
+      'If no tool is needed, respond normally.'
+   ].join('\n');
+}
+
 function buildToolSystemPrompt(tools) {
    if (!Array.isArray(tools) || tools.length === 0) return '';
 
    const defs = tools.map(t => {
       const fn = t.function || t;
       const obj = { name: fn.name };
-      if (fn.description) obj.description = fn.description;
+      if (fn.description) obj.description = fn.description.trim();
       const params = fn.parameters || fn.input_schema;
-      if (params) obj.parameters = params;
+      if (params) obj.parameters = cleanSchema(params);
       return obj;
    });
 
@@ -966,6 +1004,25 @@ async function handleOpenAIChatCompletions(req) {
       const parsedTopK = Number.parseInt(String(topKValue), 10);
       if (!Number.isFinite(parsedTopK) || parsedTopK < 1) return fail(400, 'top_k/topK must be a positive integer');
 
+      // Resolve tool names from tool_call_id before messages get modified
+      if (hasTools && Array.isArray(body.messages)) {
+         for (let i = 0; i < body.messages.length; i++) {
+            const msg = body.messages[i];
+            if (msg.role === 'tool' && !msg.name && msg.tool_call_id) {
+               for (let j = i - 1; j >= 0; j--) {
+                  const prev = body.messages[j];
+                  if (prev.role === 'assistant' && Array.isArray(prev.tool_calls)) {
+                     const match = prev.tool_calls.find(tc => tc.id === msg.tool_call_id);
+                     if (match) { msg.name = match.function?.name || match.name; break; }
+                  }
+               }
+            }
+         }
+      }
+
+      // Detect if this is a subsequent turn (tool results present = multi-turn)
+      const isSubsequentTurn = hasTools && body.messages.some(m => m.role === 'tool');
+
       const systemPrompts = [];
       let attachment = body.attachment && typeof body.attachment === 'object' ? body.attachment : null;
       const chatMessages = [];
@@ -1020,7 +1077,9 @@ async function handleOpenAIChatCompletions(req) {
          // Convert tool role messages to user messages with result context
          if (role === 'tool') {
             const toolName = msg.name || msg.tool_call_id || 'unknown';
-            chatMessages.push({ role: 'user', content: `Tool "${toolName}" returned:\n${content || '(empty)'}` });
+            // Ensure non-string content (JSON objects) gets serialized
+            const toolContent = content || (msg.content && typeof msg.content === 'object' ? JSON.stringify(msg.content) : '');
+            chatMessages.push({ role: 'user', content: `Tool "${toolName}" returned:\n${toolContent || '(empty)'}` });
             continue;
          }
 
@@ -1037,8 +1096,24 @@ async function handleOpenAIChatCompletions(req) {
       if (chatMessages.length === 0) return fail(400, 'no valid non-system messages found');
 
       const requestSystemPrompt = typeof chatOptions.systemPrompt === 'string' && chatOptions.systemPrompt.trim() ? chatOptions.systemPrompt.trim() : '';
-      const toolSystemPrompt = hasTools ? buildToolSystemPrompt(body.tools) : '';
-      const systemPrompt = [requestSystemPrompt, ...systemPrompts, toolSystemPrompt].filter(Boolean).join('\n');
+      const toolSystemPrompt = hasTools
+         ? (isSubsequentTurn ? buildToolReminderPrompt(body.tools) : buildToolSystemPrompt(body.tools))
+         : '';
+
+      // Build tool_choice hint
+      let toolChoiceHint = '';
+      if (hasTools) {
+         const tc = body.tool_choice;
+         if (tc === 'none') {
+            toolChoiceHint = '\nDo NOT call any tools. Respond in plain text only.';
+         } else if (tc && typeof tc === 'object' && tc.type === 'function' && tc.function?.name) {
+            toolChoiceHint = `\nYou MUST call the "${tc.function.name}" tool.`;
+         } else if (!isSubsequentTurn) {
+            toolChoiceHint = '\nUse a tool if needed to answer this request.';
+         }
+      }
+
+      const systemPrompt = [requestSystemPrompt, ...systemPrompts, toolSystemPrompt, toolChoiceHint].filter(Boolean).join('\n');
       const upstreamRequest = {
          messages: chatMessages,
          chatOptions: {
@@ -1158,6 +1233,11 @@ async function handleAnthropicMessages(req) {
             .join('\n');
       }
 
+      // Detect multi-turn (tool_result blocks present)
+      const isSubsequentTurn = hasTools && body.messages.some(m =>
+         m.role === 'user' && Array.isArray(m.content) && m.content.some(b => b.type === 'tool_result')
+      );
+
       if (hasTools) {
          const openAIStyleTools = body.tools.map(t => ({
             function: {
@@ -1166,8 +1246,24 @@ async function handleAnthropicMessages(req) {
                parameters: t.input_schema || t.parameters || {}
             }
          }));
-         const toolPrompt = buildToolSystemPrompt(openAIStyleTools);
-         systemPrompt = [systemPrompt, toolPrompt].filter(Boolean).join('\n');
+         const toolPrompt = isSubsequentTurn
+            ? buildToolReminderPrompt(openAIStyleTools)
+            : buildToolSystemPrompt(openAIStyleTools);
+
+         // Handle tool_choice
+         let toolChoiceHint = '';
+         const tc = body.tool_choice;
+         if (tc && typeof tc === 'object' && tc.type === 'any') {
+            toolChoiceHint = '\nYou MUST use at least one tool.';
+         } else if (tc && typeof tc === 'object' && tc.type === 'tool' && tc.name) {
+            toolChoiceHint = `\nYou MUST call the "${tc.name}" tool.`;
+         } else if (tc && typeof tc === 'object' && tc.type === 'auto') {
+            toolChoiceHint = '\nUse a tool if needed.';
+         } else if (!isSubsequentTurn) {
+            toolChoiceHint = '\nUse a tool if needed to answer this request.';
+         }
+
+         systemPrompt = [systemPrompt, toolPrompt, toolChoiceHint].filter(Boolean).join('\n');
       }
 
       const messages = [];
@@ -1185,8 +1281,8 @@ async function handleAnthropicMessages(req) {
                if (block.type === 'text' && typeof block.text === 'string') {
                   parts.push(block.text);
                } else if (block.type === 'tool_use' && msg.role === 'assistant') {
-                  const args = typeof block.input === 'string' ? block.input : JSON.stringify(block.input || {});
-                  parts.push(`${TOOL_CALLS_START}\n[{"name":"${block.name}","arguments":${args}}]\n${TOOL_CALLS_END}`);
+                  const tcObj = [{ name: block.name, arguments: typeof block.input === 'string' ? JSON.parse(block.input) : (block.input || {}) }];
+                  parts.push(`${TOOL_CALLS_START}\n${JSON.stringify(tcObj)}\n${TOOL_CALLS_END}`);
                } else if (block.type === 'tool_result' && msg.role === 'user') {
                   let resultContent = '';
                   if (typeof block.content === 'string') {
@@ -1197,10 +1293,19 @@ async function handleAnthropicMessages(req) {
                         .map(b => b.text)
                         .join('\n');
                   }
+                  // Resolve actual tool name from tool_use_id
+                  let toolName = block.tool_use_id || 'unknown';
+                  if (block.tool_use_id) {
+                     for (const prevMsg of body.messages) {
+                        if (prevMsg.role !== 'assistant' || !Array.isArray(prevMsg.content)) continue;
+                        const match = prevMsg.content.find(b => b.type === 'tool_use' && b.id === block.tool_use_id);
+                        if (match) { toolName = match.name || toolName; break; }
+                     }
+                  }
                   if (block.is_error) {
-                     parts.push(`Tool "${block.tool_use_id || 'unknown'}" error:\n${resultContent || 'unknown error'}`);
-                  } else if (resultContent) {
-                     parts.push(`Tool "${block.tool_use_id || 'unknown'}" returned:\n${resultContent}`);
+                     parts.push(`Tool "${toolName}" error:\n${resultContent || 'unknown error'}`);
+                  } else {
+                     parts.push(`Tool "${toolName}" returned:\n${resultContent || '(empty)'}`);
                   }
                }
             }
