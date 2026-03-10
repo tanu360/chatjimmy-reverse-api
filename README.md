@@ -120,6 +120,25 @@ const message = await client.messages.create({
 console.log(message.content[0].text);
 ```
 
+### With Vanilla JS (fetch)
+
+```javascript
+const res = await fetch("https://jimmy.aikit.club/v1/chat/completions", {
+  method: "POST",
+  headers: {
+    Authorization: "Bearer tarun-mykey",
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    model: "llama3.1-8B",
+    messages: [{ role: "user", content: "Hello!" }],
+  }),
+});
+
+const data = await res.json();
+console.log(data.choices[0].message.content);
+```
+
 ---
 
 <a id="examples"></a>
@@ -173,6 +192,29 @@ curl https://jimmy.aikit.club/v1/chat/completions \
     "messages": [{"role": "user", "content": "What is 2+2?"}],
     "stream": false
   }'
+```
+
+### Non-Streaming (Vanilla JS)
+
+```javascript
+const res = await fetch("https://jimmy.aikit.club/v1/chat/completions", {
+  method: "POST",
+  headers: {
+    Authorization: "Bearer tarun-mykey",
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    model: "llama3.1-8B",
+    messages: [
+      { role: "system", content: "You are a helpful assistant." },
+      { role: "user", content: "What is 2+2?" },
+    ],
+    stream: false,
+  }),
+});
+
+const data = await res.json();
+console.log(data.choices[0].message.content); // "2 + 2 = 4"
 ```
 
 **Response:**
@@ -255,6 +297,88 @@ curl https://jimmy.aikit.club/v1/messages \
       }
     }]
   }'
+```
+
+### Tool Calling — Vanilla JS (OpenAI Format)
+
+```javascript
+const res = await fetch("https://jimmy.aikit.club/v1/chat/completions", {
+  method: "POST",
+  headers: {
+    Authorization: "Bearer tarun-mykey",
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    model: "llama3.1-8B",
+    messages: [{ role: "user", content: "What is the weather in Tokyo?" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "get_weather",
+          description: "Get current weather",
+          parameters: {
+            type: "object",
+            properties: { city: { type: "string" } },
+            required: ["city"],
+          },
+        },
+      },
+    ],
+  }),
+});
+
+const data = await res.json();
+const msg = data.choices[0].message;
+
+if (msg.tool_calls) {
+  for (const tc of msg.tool_calls) {
+    console.log(tc.function.name); // "get_weather"
+    console.log(JSON.parse(tc.function.arguments)); // { city: "Tokyo" }
+  }
+} else {
+  console.log(msg.content);
+}
+```
+
+### Tool Calling — Vanilla JS (Anthropic Format)
+
+```javascript
+const res = await fetch("https://jimmy.aikit.club/v1/messages", {
+  method: "POST",
+  headers: {
+    Authorization: "Bearer tarun-mykey",
+    "Content-Type": "application/json",
+    "anthropic-version": "2023-06-01",
+  },
+  body: JSON.stringify({
+    model: "llama3.1-8B",
+    max_tokens: 1024,
+    messages: [{ role: "user", content: "What is the weather in Tokyo?" }],
+    tools: [
+      {
+        name: "get_weather",
+        description: "Get current weather",
+        input_schema: {
+          type: "object",
+          properties: { city: { type: "string" } },
+          required: ["city"],
+        },
+      },
+    ],
+  }),
+});
+
+const data = await res.json();
+
+for (const block of data.content) {
+  if (block.type === "tool_use") {
+    console.log(block.name); // "get_weather"
+    console.log(block.input); // { city: "Tokyo" }
+  } else if (block.type === "text") {
+    console.log(block.text);
+  }
+}
 ```
 
 > **Note:** Tool calling reliability depends on the underlying model (llama3.1-8B). Complex tool schemas with many parameters may not always produce valid JSON.
