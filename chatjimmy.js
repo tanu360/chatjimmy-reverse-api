@@ -540,7 +540,25 @@ function getToolCallInput(payload) {
    return {};
 }
 
-function extractCallsFromPayload(payload, toolContext) {
+function hasToolInputField(payload) {
+   if (!payload || typeof payload !== 'object') return false;
+   return Object.prototype.hasOwnProperty.call(payload, 'input')
+      || Object.prototype.hasOwnProperty.call(payload, 'arguments')
+      || Object.prototype.hasOwnProperty.call(payload, 'args')
+      || Object.prototype.hasOwnProperty.call(payload, 'parameters')
+      || Object.prototype.hasOwnProperty.call(payload, 'function.arguments');
+}
+
+function hasExplicitToolPayloadShape(payload) {
+   if (!payload || typeof payload !== 'object') return false;
+   if (Array.isArray(payload)) return payload.some(item => hasExplicitToolPayloadShape(item));
+   if (Array.isArray(payload.tool_calls)) return payload.tool_calls.some(item => hasExplicitToolPayloadShape(item));
+   if (payload.function && typeof payload.function === 'object') return hasExplicitToolPayloadShape(payload.function);
+   const name = payload.name || payload['function.name'];
+   return typeof name === 'string' && name.trim() && hasToolInputField(payload);
+}
+
+function extractCallsFromPayload(payload, toolContext, options = {}) {
    const valid = [];
    const invalid = [];
 
@@ -556,6 +574,7 @@ function extractCallsFromPayload(payload, toolContext) {
       }
       const name = item.name || item['function.name'];
       if (typeof name !== 'string' || !name.trim()) return;
+      if (options.requireInputField && !hasToolInputField(item)) return;
       const originalName = resolveToolName(name, toolContext);
       if (!originalName) {
          invalid.push({ name, reason: 'unknown_tool_name' });
@@ -587,7 +606,7 @@ function removeRanges(text, ranges) {
    return out.trim();
 }
 
-function addParsedToolPayload(raw, range, source, toolContext, state) {
+function addParsedToolPayload(raw, range, source, toolContext, state, options = {}) {
    const unwrapped = unwrapMarkdownFence(raw);
    let parsed = safeJsonParse(unwrapped);
    if (!parsed.ok) parsed = safeJsonParse(repairLooseToolJson(unwrapped));
@@ -598,7 +617,9 @@ function addParsedToolPayload(raw, range, source, toolContext, state) {
       return;
    }
 
-   const { valid, invalid } = extractCallsFromPayload(parsed.value, toolContext);
+   if (options.requireExplicitToolShape && !hasExplicitToolPayloadShape(parsed.value)) return;
+
+   const { valid, invalid } = extractCallsFromPayload(parsed.value, toolContext, options);
    if (valid.length > 0) state.toolCalls.push(...valid);
    if (range && (valid.length > 0 || invalid.length > 0)) state.ranges.push(range);
    if (invalid.length > 0) state.invalidToolCalls.push(...invalid.map(item => ({ ...item, source })));
@@ -646,7 +667,7 @@ function countTextOccurrences(text, needle) {
 
 function isProbablyIncompleteJson(text) {
    const trimmed = String(text || '').trim();
-   if (!/^[\[{]/.test(trimmed) || !/"(?:name|tool_calls|function|function\.name)"\s*:/.test(trimmed)) return false;
+   if (!/^[\[{]/.test(trimmed) || !/"(?:tool_calls|function|function\.name|arguments|input|args|parameters|function\.arguments)"\s*:/.test(trimmed)) return false;
    if (safeJsonParse(trimmed).ok) return false;
    const stack = [];
    let inString = false;
@@ -691,6 +712,7 @@ function hasToolSyntax(text) {
 
 function parseToolCalls(text, toolContext = null) {
    const sourceText = String(text || '');
+   const allowFallbackJson = !!toolContext?.hasTools;
    const state = {
       toolCalls: [],
       invalidToolCalls: [],
@@ -703,12 +725,12 @@ function parseToolCalls(text, toolContext = null) {
    collectRegexToolBlocks(sourceText, /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi, 'xml_tool_call', toolContext, state);
    collectRegexToolBlocks(sourceText, /```tool_call\s*([\s\S]*?)```/gi, 'fenced_tool_call', toolContext, state);
 
-   if (state.toolCalls.length === 0) {
+   if (state.toolCalls.length === 0 && allowFallbackJson) {
       const trimmed = unwrapMarkdownFence(sourceText);
       const parsed = safeJsonParse(trimmed);
-      if (parsed.ok) {
+      if (parsed.ok && hasExplicitToolPayloadShape(parsed.value)) {
          const before = state.toolCalls.length;
-         const { valid, invalid } = extractCallsFromPayload(parsed.value, toolContext);
+         const { valid, invalid } = extractCallsFromPayload(parsed.value, toolContext, { requireInputField: true });
          state.toolCalls.push(...valid);
          state.invalidToolCalls.push(...invalid.map(item => ({ ...item, source: 'bare_json' })));
          if (state.toolCalls.length > before || invalid.length > 0) state.ranges.push([0, sourceText.length]);
@@ -716,10 +738,13 @@ function parseToolCalls(text, toolContext = null) {
       }
    }
 
-   if (state.toolCalls.length === 0) {
+   if (state.toolCalls.length === 0 && allowFallbackJson) {
       const firstObj = findFirstJsonObject(sourceText);
       if (firstObj && /"name"\s*:|"tool_calls"\s*:|"function"\s*:|"function\.name"\s*:/.test(firstObj.raw)) {
-         addParsedToolPayload(firstObj.raw, [firstObj.start, firstObj.end], 'embedded_json', toolContext, state);
+         addParsedToolPayload(firstObj.raw, [firstObj.start, firstObj.end], 'embedded_json', toolContext, state, {
+            requireExplicitToolShape: true,
+            requireInputField: true
+         });
       }
    }
 
@@ -1251,7 +1276,77 @@ function createAnthropicToolStream(toolResult, requestModel) {
    });
 }
 
-function handleOpenAIStreamingResponse(upstreamResponse, requestModel, includeUsage, hasTools) {
+async function pumpJimmyTextStream(upstreamResponse, onText) {
+   const reader = upstreamResponse.body.getReader();
+   const decoder = new TextDecoder();
+   const markerLookbehind = Math.max(STATS_START.length, THINK_START.length, TOOL_CALLS_START.length) - 1;
+   let buffer = '';
+   let stats = null;
+
+   while (true) {
+      const { done, value } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: true });
+
+      while (true) {
+         const statsStart = buffer.indexOf(STATS_START);
+         const thinkStart = buffer.indexOf(THINK_START);
+         let markerStart = -1;
+         let markerType = '';
+
+         const candidates = [
+            statsStart !== -1 ? [statsStart, 'stats'] : null,
+            thinkStart !== -1 ? [thinkStart, 'think'] : null
+         ].filter(Boolean).sort((a, b) => a[0] - b[0]);
+
+         if (candidates.length > 0) {
+            markerStart = candidates[0][0];
+            markerType = candidates[0][1];
+         }
+
+         if (markerStart === -1) break;
+
+         if (markerStart > 0) {
+            await onText(buffer.slice(0, markerStart));
+            buffer = buffer.slice(markerStart);
+         }
+
+         if (markerType === 'think') {
+            const thinkEnd = buffer.indexOf(THINK_END, THINK_START.length);
+            if (thinkEnd === -1) break;
+            buffer = buffer.slice(thinkEnd + THINK_END.length);
+            continue;
+         }
+
+         const statsEnd = buffer.indexOf(STATS_END, STATS_START.length);
+         if (statsEnd === -1) break;
+
+         try {
+            stats = JSON.parse(buffer.slice(STATS_START.length, statsEnd));
+         } catch (e) {
+            // Ignore parse errors.
+         }
+
+         buffer = buffer.slice(statsEnd + STATS_END.length);
+      }
+
+      const noMarkers = buffer.indexOf(STATS_START) === -1 && buffer.indexOf(THINK_START) === -1;
+      if (!done && noMarkers && buffer.length > markerLookbehind) {
+         const safeChunk = buffer.slice(0, buffer.length - markerLookbehind);
+         buffer = buffer.slice(buffer.length - markerLookbehind);
+         if (safeChunk) await onText(safeChunk);
+      }
+
+      if (done) {
+         buffer += decoder.decode();
+         const parsed = parseJimmyResponse(buffer);
+         if (parsed.stats) stats = parsed.stats;
+         if (parsed.content) await onText(parsed.content);
+         return stats;
+      }
+   }
+}
+
+function handleOpenAIStreamingResponse(upstreamResponse, requestModel, includeUsage) {
    const { readable, writable } = new TransformStream();
    const writer = writable.getWriter();
    const encoder = new TextEncoder();
@@ -1264,11 +1359,6 @@ function handleOpenAIStreamingResponse(upstreamResponse, requestModel, includeUs
 
    (async () => {
       try {
-         const reader = upstreamResponse.body.getReader();
-         const decoder = new TextDecoder();
-         const markerLookbehind = Math.max(STATS_START.length, THINK_START.length, TOOL_CALLS_START.length) - 1;
-         let buffer = '';
-         let stats = null;
          let sentRole = false;
 
          const sendRole = async () => {
@@ -1280,161 +1370,20 @@ function handleOpenAIStreamingResponse(upstreamResponse, requestModel, includeUs
             });
          };
 
-         let fullText = '';
-         if (!hasTools) await sendRole();
+         await sendRole();
+         const stats = await pumpJimmyTextStream(upstreamResponse, async (text) => {
+            if (!text) return;
+            await sendRole();
+            await writeChunk({
+               id, object: 'chat.completion.chunk', created, model: requestModel,
+               choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
+            });
+         });
 
-         while (true) {
-            const { done, value } = await reader.read();
-            if (value) buffer += decoder.decode(value, { stream: true });
-
-            while (true) {
-               const statsStart = buffer.indexOf(STATS_START);
-               const thinkStart = buffer.indexOf(THINK_START);
-               const toolStart = buffer.indexOf(TOOL_CALLS_START);
-               let markerStart = -1;
-               let markerType = '';
-
-               const candidates = [
-                  statsStart !== -1 ? [statsStart, 'stats'] : null,
-                  thinkStart !== -1 ? [thinkStart, 'think'] : null,
-                  toolStart !== -1 ? [toolStart, 'tool'] : null
-               ].filter(Boolean).sort((a, b) => a[0] - b[0]);
-
-               if (candidates.length > 0) {
-                  markerStart = candidates[0][0];
-                  markerType = candidates[0][1];
-               }
-
-               if (markerStart === -1) break;
-
-               if (markerStart > 0 && !hasTools) {
-                  await sendRole();
-                  await writeChunk({
-                     id, object: 'chat.completion.chunk', created, model: requestModel,
-                     choices: [{ index: 0, delta: { content: buffer.slice(0, markerStart) }, finish_reason: null }]
-                  });
-               }
-               if (markerStart > 0 && hasTools) {
-                  fullText += buffer.slice(0, markerStart);
-               }
-               if (markerStart > 0) buffer = buffer.slice(markerStart);
-
-               if (markerType === 'think') {
-                  const thinkEnd = buffer.indexOf(THINK_END, THINK_START.length);
-                  if (thinkEnd === -1) break;
-                  buffer = buffer.slice(thinkEnd + THINK_END.length);
-                  continue;
-               }
-
-               if (markerType === 'tool') {
-                  const toolEnd = buffer.indexOf(TOOL_CALLS_END, TOOL_CALLS_START.length);
-                  if (toolEnd === -1) break;
-                  // Keep the tool block intact in buffer for final parsing
-                  break;
-               }
-
-               const statsEnd = buffer.indexOf(STATS_END, STATS_START.length);
-               if (statsEnd === -1) break;
-
-               try {
-                  stats = JSON.parse(buffer.slice(STATS_START.length, statsEnd));
-               } catch (e) {
-                  // Ignore parse errors.
-               }
-
-               buffer = buffer.slice(statsEnd + STATS_END.length);
-            }
-
-            const noMarkers = buffer.indexOf(STATS_START) === -1
-               && buffer.indexOf(THINK_START) === -1
-               && buffer.indexOf(TOOL_CALLS_START) === -1;
-
-            if (!done && noMarkers && buffer.length > markerLookbehind) {
-               const safeChunk = buffer.slice(0, buffer.length - markerLookbehind);
-               buffer = buffer.slice(buffer.length - markerLookbehind);
-               if (safeChunk && !hasTools) {
-                  await sendRole();
-                  await writeChunk({
-                     id, object: 'chat.completion.chunk', created, model: requestModel,
-                     choices: [{ index: 0, delta: { content: safeChunk }, finish_reason: null }]
-                  });
-               } else if (safeChunk && hasTools) {
-                  fullText += safeChunk;
-               }
-            }
-
-            if (done) {
-               buffer += decoder.decode();
-               if (hasTools) buffer = fullText + buffer;
-               const parsed = parseJimmyResponse(buffer);
-               if (parsed.stats) stats = parsed.stats;
-
-               if (hasTools) {
-                  const { toolCalls, textContent } = parseToolCalls(parsed.content);
-
-                  if (toolCalls.length > 0) {
-                     await sendRole();
-                     if (textContent) {
-                        await writeChunk({
-                           id, object: 'chat.completion.chunk', created, model: requestModel,
-                           choices: [{ index: 0, delta: { content: textContent }, finish_reason: null }]
-                        });
-                     }
-                     for (let i = 0; i < toolCalls.length; i++) {
-                        const tc = toolCalls[i];
-                        const args = typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments);
-                        await writeChunk({
-                           id, object: 'chat.completion.chunk', created, model: requestModel,
-                           choices: [{
-                              index: 0, delta: {
-                                 tool_calls: [{
-                                    index: i,
-                                    id: `call_${Math.random().toString(36).substring(2, 11)}`,
-                                    type: 'function',
-                                    function: { name: tc.name, arguments: args }
-                                 }]
-                              }, finish_reason: null
-                           }]
-                        });
-                     }
-
-                     await writeChunk({
-                        id, object: 'chat.completion.chunk', created, model: requestModel,
-                        choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }]
-                     });
-                  } else {
-                     await sendRole();
-                     if (textContent) {
-                        await writeChunk({
-                           id, object: 'chat.completion.chunk', created, model: requestModel,
-                           choices: [{ index: 0, delta: { content: textContent }, finish_reason: null }]
-                        });
-                     }
-                     await writeChunk({
-                        id, object: 'chat.completion.chunk', created, model: requestModel,
-                        choices: [{ index: 0, delta: {}, finish_reason: getOpenAIStopReason(stats) }]
-                     });
-                  }
-               } else {
-                  if (parsed.content) {
-                     await writeChunk({
-                        id, object: 'chat.completion.chunk', created, model: requestModel,
-                        choices: [{ index: 0, delta: { content: parsed.content }, finish_reason: null }]
-                     });
-                  }
-                  await writeChunk({
-                     id, object: 'chat.completion.chunk', created, model: requestModel,
-                     choices: [{ index: 0, delta: {}, finish_reason: getOpenAIStopReason(stats) }]
-                  });
-               }
-
-               break;
-            }
-         }
-
-         if (!hasTools) {
-            // finish_reason already sent above in the `done` block
-         }
+         await writeChunk({
+            id, object: 'chat.completion.chunk', created, model: requestModel,
+            choices: [{ index: 0, delta: {}, finish_reason: getOpenAIStopReason(stats) }]
+         });
 
          if (includeUsage && stats) {
             await writeChunk({
@@ -1501,7 +1450,7 @@ async function handleOpenAINonStreamingResponse(upstreamResponse, requestModel, 
    return json(200, response);
 }
 
-function handleAnthropicStreamingResponse(upstreamResponse, requestModel, hasTools) {
+function handleAnthropicStreamingResponse(upstreamResponse, requestModel) {
    const { readable, writable } = new TransformStream();
    const writer = writable.getWriter();
    const encoder = new TextEncoder();
@@ -1509,11 +1458,6 @@ function handleAnthropicStreamingResponse(upstreamResponse, requestModel, hasToo
 
    (async () => {
       try {
-         const reader = upstreamResponse.body.getReader();
-         const decoder = new TextDecoder();
-         const markerLookbehind = Math.max(STATS_START.length, THINK_START.length, TOOL_CALLS_START.length) - 1;
-         let buffer = '';
-         let stats = null;
          let messageStartSent = false;
          let textBlockStarted = false;
 
@@ -1550,203 +1494,36 @@ function handleAnthropicStreamingResponse(upstreamResponse, requestModel, hasToo
             });
          };
 
-         let fullText = '';
-         if (!hasTools) {
+         await startTextBlock();
+         const stats = await pumpJimmyTextStream(upstreamResponse, async (text) => {
+            if (!text) return;
             await startTextBlock();
-         }
+            await writeEvent('content_block_delta', {
+               type: 'content_block_delta',
+               index: 0,
+               delta: { type: 'text_delta', text }
+            });
+         });
 
-         while (true) {
-            const { done, value } = await reader.read();
-            if (value) buffer += decoder.decode(value, { stream: true });
+         await writeEvent('content_block_stop', {
+            type: 'content_block_stop',
+            index: 0
+         });
 
-            while (true) {
-               const statsStart = buffer.indexOf(STATS_START);
-               const thinkStart = buffer.indexOf(THINK_START);
-               const toolStart = buffer.indexOf(TOOL_CALLS_START);
-               let markerStart = -1;
-               let markerType = '';
-
-               const candidates = [
-                  statsStart !== -1 ? [statsStart, 'stats'] : null,
-                  thinkStart !== -1 ? [thinkStart, 'think'] : null,
-                  toolStart !== -1 ? [toolStart, 'tool'] : null
-               ].filter(Boolean).sort((a, b) => a[0] - b[0]);
-
-               if (candidates.length > 0) {
-                  markerStart = candidates[0][0];
-                  markerType = candidates[0][1];
-               }
-
-               if (markerStart === -1) break;
-
-               if (markerStart > 0 && !hasTools) {
-                  await startTextBlock();
-                  await writeEvent('content_block_delta', {
-                     type: 'content_block_delta',
-                     index: 0,
-                     delta: { type: 'text_delta', text: buffer.slice(0, markerStart) }
-                  });
-               }
-               if (markerStart > 0 && hasTools) {
-                  fullText += buffer.slice(0, markerStart);
-               }
-               if (markerStart > 0) buffer = buffer.slice(markerStart);
-
-               if (markerType === 'think') {
-                  const thinkEnd = buffer.indexOf(THINK_END, THINK_START.length);
-                  if (thinkEnd === -1) break;
-                  buffer = buffer.slice(thinkEnd + THINK_END.length);
-                  continue;
-               }
-
-               if (markerType === 'tool') {
-                  const toolEnd = buffer.indexOf(TOOL_CALLS_END, TOOL_CALLS_START.length);
-                  if (toolEnd === -1) break;
-                  break;
-               }
-
-               const statsEnd = buffer.indexOf(STATS_END, STATS_START.length);
-               if (statsEnd === -1) break;
-
-               try {
-                  stats = JSON.parse(buffer.slice(STATS_START.length, statsEnd));
-               } catch (e) {
-                  // Ignore parse errors.
-               }
-
-               buffer = buffer.slice(statsEnd + STATS_END.length);
+         await writeEvent('message_delta', {
+            type: 'message_delta',
+            delta: {
+               stop_reason: getAnthropicStopReason(stats),
+               stop_sequence: null
+            },
+            usage: {
+               input_tokens: stats?.prefill_tokens || 0,
+               output_tokens: stats?.decode_tokens || 0,
+               ...buildUsage(stats)
             }
+         });
 
-            const noMarkers = buffer.indexOf(STATS_START) === -1
-               && buffer.indexOf(THINK_START) === -1
-               && buffer.indexOf(TOOL_CALLS_START) === -1;
-
-            if (!done && noMarkers && buffer.length > markerLookbehind) {
-               const safeChunk = buffer.slice(0, buffer.length - markerLookbehind);
-               buffer = buffer.slice(buffer.length - markerLookbehind);
-               if (safeChunk && !hasTools) {
-                  await startTextBlock();
-                  await writeEvent('content_block_delta', {
-                     type: 'content_block_delta',
-                     index: 0,
-                     delta: { type: 'text_delta', text: safeChunk }
-                  });
-               } else if (safeChunk && hasTools) {
-                  fullText += safeChunk;
-               }
-            }
-
-            if (done) {
-               buffer += decoder.decode();
-               if (hasTools) buffer = fullText + buffer;
-               const parsed = parseJimmyResponse(buffer);
-               if (parsed.stats) stats = parsed.stats;
-
-               if (hasTools) {
-                  const { toolCalls, textContent } = parseToolCalls(parsed.content);
-                  const hasToolCalls = toolCalls.length > 0;
-                  let blockIndex = 0;
-
-                  await sendMessageStart();
-
-                  if (textContent) {
-                     await writeEvent('content_block_start', {
-                        type: 'content_block_start',
-                        index: blockIndex,
-                        content_block: { type: 'text', text: '' }
-                     });
-                     await writeEvent('content_block_delta', {
-                        type: 'content_block_delta',
-                        index: blockIndex,
-                        delta: { type: 'text_delta', text: textContent }
-                     });
-                     await writeEvent('content_block_stop', {
-                        type: 'content_block_stop',
-                        index: blockIndex
-                     });
-                     blockIndex++;
-                  }
-
-                  if (hasToolCalls) {
-                     for (const tc of toolCalls) {
-                        const toolId = `toolu_${Math.random().toString(36).substring(2, 14)}`;
-                        let input;
-                        try { input = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : tc.arguments; } catch (_) { input = {}; }
-
-                        await writeEvent('content_block_start', {
-                           type: 'content_block_start',
-                           index: blockIndex,
-                           content_block: { type: 'tool_use', id: toolId, name: tc.name, input: {} }
-                        });
-                        await writeEvent('content_block_delta', {
-                           type: 'content_block_delta',
-                           index: blockIndex,
-                           delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) }
-                        });
-                        await writeEvent('content_block_stop', {
-                           type: 'content_block_stop',
-                           index: blockIndex
-                        });
-                        blockIndex++;
-                     }
-                  }
-
-                  if (blockIndex === 0) {
-                     await writeEvent('content_block_start', {
-                        type: 'content_block_start',
-                        index: 0,
-                        content_block: { type: 'text', text: '' }
-                     });
-                     await writeEvent('content_block_stop', {
-                        type: 'content_block_stop',
-                        index: 0
-                     });
-                  }
-
-                  await writeEvent('message_delta', {
-                     type: 'message_delta',
-                     delta: {
-                        stop_reason: hasToolCalls ? 'tool_use' : getAnthropicStopReason(stats),
-                        stop_sequence: null
-                     },
-                     usage: {
-                        input_tokens: stats?.prefill_tokens || 0,
-                        output_tokens: stats?.decode_tokens || 0,
-                        ...buildUsage(stats)
-                     }
-                  });
-               } else {
-                  if (parsed.content) {
-                     await writeEvent('content_block_delta', {
-                        type: 'content_block_delta',
-                        index: 0,
-                        delta: { type: 'text_delta', text: parsed.content }
-                     });
-                  }
-
-                  await writeEvent('content_block_stop', {
-                     type: 'content_block_stop',
-                     index: 0
-                  });
-
-                  await writeEvent('message_delta', {
-                     type: 'message_delta',
-                     delta: {
-                        stop_reason: getAnthropicStopReason(stats),
-                        stop_sequence: null
-                     },
-                     usage: {
-                        input_tokens: stats?.prefill_tokens || 0,
-                        output_tokens: stats?.decode_tokens || 0,
-                        ...buildUsage(stats)
-                     }
-                  });
-               }
-
-               await writeEvent('message_stop', { type: 'message_stop' });
-               break;
-            }
-         }
+         await writeEvent('message_stop', { type: 'message_stop' });
       } catch (error) {
          const errorResponse = anthropicStreamError(error.message || 'Streaming error');
          await writer.write(encoder.encode(await errorResponse.text()));
@@ -2028,7 +1805,7 @@ async function handleOpenAIChatCompletions(req) {
          return formatOpenAIToolResponse(toolResult, model);
       }
 
-      if (stream) return handleOpenAIStreamingResponse(upstreamResponse, model, body?.stream_options?.include_usage === true, false);
+      if (stream) return handleOpenAIStreamingResponse(upstreamResponse, model, body?.stream_options?.include_usage === true);
       return handleOpenAINonStreamingResponse(upstreamResponse, model, false);
    } catch (error) {
       const isTimeout = error?.name === 'AbortError';
@@ -2253,7 +2030,7 @@ async function handleAnthropicMessages(req) {
          return formatAnthropicToolResponse(toolResult, body.model);
       }
 
-      if (body.stream === true) return handleAnthropicStreamingResponse(upstreamResponse, body.model, false);
+      if (body.stream === true) return handleAnthropicStreamingResponse(upstreamResponse, body.model);
       return await handleAnthropicNonStreamingResponse(upstreamResponse, body.model, false);
    } catch (error) {
       const isTimeout = error?.name === 'AbortError';
