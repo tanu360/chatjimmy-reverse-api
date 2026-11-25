@@ -623,6 +623,7 @@ function addParsedToolPayload(raw, range, source, toolContext, state, options = 
 
    const { valid, invalid } = extractCallsFromPayload(parsed.value, toolContext, options);
    if (valid.length > 0) state.toolCalls.push(...valid);
+   if (range && valid.length > 0) state.claimedRanges.push(range);
    if (range && (valid.length > 0 || invalid.length > 0)) state.ranges.push(range);
    if (invalid.length > 0) state.invalidToolCalls.push(...invalid.map(item => ({ ...item, source })));
    if (valid.length > 0 || invalid.length > 0) state.sawToolSyntax = true;
@@ -631,6 +632,10 @@ function addParsedToolPayload(raw, range, source, toolContext, state, options = 
 function collectRegexToolBlocks(text, regex, source, toolContext, state) {
    let match;
    while ((match = regex.exec(text)) !== null) {
+      const start = match.index;
+      const end = match.index + match[0].length;
+      // Skip blocks nested inside an already-parsed block to avoid duplicate tool calls.
+      if (state.claimedRanges.some(([s, e]) => start < e && end > s)) continue;
       addParsedToolPayload(match[1], [match.index, match.index + match[0].length], source, toolContext, state);
    }
 }
@@ -719,6 +724,7 @@ function parseToolCalls(text, toolContext = null) {
       toolCalls: [],
       invalidToolCalls: [],
       ranges: [],
+      claimedRanges: [],
       sawToolSyntax: hasToolSyntax(sourceText)
    };
 
