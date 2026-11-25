@@ -1709,7 +1709,9 @@ async function handleOpenAIChatCompletions(req) {
             try {
                tcJson = msg.tool_calls.map(tc => ({
                   name: getQwenNameForTool(tc.function?.name || tc.name, toolContext),
-                  arguments: typeof tc.function?.arguments === 'string' ? JSON.parse(tc.function.arguments) : (tc.function?.arguments || tc.arguments || {})
+                  arguments: typeof tc.function?.arguments === 'string'
+                     ? (tc.function.arguments.trim() ? JSON.parse(tc.function.arguments) : {})
+                     : (tc.function?.arguments || tc.arguments || {})
                }));
             } catch (e) {
                return fail(400, 'Malformed JSON in tool_calls[].function.arguments', 'invalid_tool_call');
