@@ -350,6 +350,8 @@ function buildRecentToolHistory(messages, toolContext, toolChoice) {
 
    const callsById = new Map();
    for (const msg of messages) {
+      // Only the latest assistant turn's completed calls count as a repeat; older calls may be legitimately re-run.
+      if (msg?.role === 'assistant') history.completed.clear();
       if (msg?.role === 'assistant' && Array.isArray(msg.tool_calls)) {
          for (const tc of msg.tool_calls) {
             const name = tc.function?.name || tc.name;
